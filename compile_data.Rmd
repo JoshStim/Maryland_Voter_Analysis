@@ -1,0 +1,125 @@
+---
+title: "compile_data"
+output: html_document
+date: "2025-02-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidycensus)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+```
+
+```{r}
+#census_api_key("YOUR_CENSUS_API_KEY", install = TRUE)
+#Sys.getenv("CENSUS_API_KEY")
+turnout_block <- read.csv("MD_l2_2022stats_2020block.csv", header = TRUE)
+```
+
+# census-tract level
+
+## extract predictor variables from tidycensus
+```{r}
+vars <- c(
+  "B19013_001",  # Income
+  "B15003_001", "B15003_017", "B15003_023", "B15003_025", # Education
+  "B23025_004", "B23025_005", # Employment
+  "B08006_001", "B08006_002", "B08006_008", "B08006_014" # Transportation
+)
+# pull data
+md_tract_data <- get_acs(
+  geography = "tract", # Pulls data at the census-tract level
+  state = "MD",
+  variables = vars,
+  year = 2022,
+  survey = "acs5" # latest 5-year average
+)
+
+# Display data in a user-friendly format
+md_tract_data_wide <- md_tract_data %>%
+  select(GEOID, NAME, variable, estimate) %>%
+  pivot_wider(names_from = variable, values_from = estimate) %>%
+  rename(
+    edian_Household_Income = B19013_001,
+    
+    Total_Education_Population = B15003_001,
+    High_School_Graduate = B15003_017,
+    Bachelors_Degree = B15003_023,
+    Graduate_Professional_Degree = B15003_025,
+    
+    Total_Employed = B23025_004,
+    Total_Unemployed = B23025_005,
+    
+    Total_Commuters = B08006_001,
+    Drove_Alone_to_Work = B08006_002,
+    Public_Transportation_Users = B08006_008,
+    Worked_From_Home = B08006_014
+  )
+```
+
+## extract outcome variable and demographic information for eligible voters
+```{r}
+# Aggregate data at the census-tract level
+turnout_tract <- turnout_block %>%
+  mutate(GEOID = substr(geoid20, 1, 11)) %>%
+  select(GEOID, geoid20, g20221108_voted_all, g20221108_reg_all, # General election 2022
+         total_reg,
+         age_18_19, age_20_24, age_25_29, age_30_34, age_35_44, age_45_54, age_55_64, 
+         age_65_74, age_75_84, age_85over, 
+         voters_gender_m, voters_gender_f, voters_gender_unknown, 
+         eth1_eur, eth1_hisp, eth1_aa, eth1_esa, eth1_oth, eth1_unk) %>% 
+  filter(!grepl("^0", GEOID)) %>% # filter out not-assigned blocks
+  group_by(GEOID) %>%  # Group by Census Tract (GEOID)
+  summarise(
+    # Summarize total registered and voted
+    Total_voted = sum(g20221108_voted_all, na.rm = TRUE),    # Total votes cast
+    Total_reg = sum(g20221108_reg_all, na.rm = TRUE),        # Total registered voters
+    Turnout_Rate = Total_voted / Total_reg,
+    
+    # Gender percentages
+    Male_Count = sum(voters_gender_m, na.rm = TRUE),
+    Female_Count = sum(voters_gender_f, na.rm = TRUE),
+    Unknown_Gender_Count = sum(voters_gender_unknown, na.rm = TRUE),
+    Male_Pct = Male_Count / Total_reg * 100,
+    Female_Pct = Female_Count / Total_reg * 100,
+    Unknown_Gender_Pct = Unknown_Gender_Count / Total_reg * 100,
+    
+    # Age group percentages
+    Age_18_19_Count = sum(age_18_19, na.rm = TRUE),
+    Age_20_24_Count = sum(age_20_24, na.rm = TRUE),
+    Age_25_29_Count = sum(age_25_29, na.rm = TRUE),
+    Age_30_34_Count = sum(age_30_34, na.rm = TRUE),
+    Age_35_44_Count = sum(age_35_44, na.rm = TRUE),
+    Age_45_54_Count = sum(age_45_54, na.rm = TRUE),
+    Age_55_64_Count = sum(age_55_64, na.rm = TRUE),
+    Age_65_74_Count = sum(age_65_74, na.rm = TRUE),
+    Age_75_84_Count = sum(age_75_84, na.rm = TRUE),
+    Age_85over_Count = sum(age_85over, na.rm = TRUE),
+    
+    # Race/ethnicity percentages
+    White_Count = sum(eth1_eur, na.rm = TRUE),
+    Hispanic_Count = sum(eth1_hisp, na.rm = TRUE),
+    Black_Count = sum(eth1_aa, na.rm = TRUE),
+    Asian_Count = sum(eth1_esa, na.rm = TRUE),
+    Other_Race_Count = sum(eth1_oth, na.rm = TRUE),
+    Unknown_Race_Count = sum(eth1_unk, na.rm = TRUE),
+    
+    White_Pct = White_Count / Total_reg * 100,
+    Hispanic_Pct = Hispanic_Count / Total_reg * 100,
+    Black_Pct = Black_Count / Total_reg * 100,
+    Asian_Pct = Asian_Count / Total_reg * 100,
+    Other_Race_Pct = Other_Race_Count / Total_reg * 100,
+    Unknown_Race_Pct = Unknown_Race_Count / Total_reg * 100
+  ) 
+  
+  # Combine
+combined_tract_data <- turnout_tract %>%
+  left_join(md_tract_data_wide, by = "GEOID")
+
+write.csv(combined_tract_data, "/Users/huangjiaxin/Desktop/JHU/7th term/combined_tract_data.csv", row.names = FALSE)
+```
+
+
+
