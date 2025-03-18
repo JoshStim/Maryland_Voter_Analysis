@@ -1,0 +1,2140 @@
+---
+title: "Maryland Voter Turnout"
+author: "Josh Stim"
+date: "2025-02-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(patchwork)
+library(tidycensus)
+library(see)
+library(lme4)
+library(lmerTest)
+library(lmtest)
+library(ggcorrplot)
+select <- dplyr::select
+```
+
+# Introduction
+
+# Data Cleaning
+
+The data used for this project come from two sources: L2 (via Redistricting Hub), and the American Community Survey (ACS via `tidycensus`). These data sources are summarized below:
+
+## L2 (Redistricting Hub): 
+
+We obtained demographic and turnout data on the census-block-level for *registered voters* in Maryland in 2022. These included: 1) the total number of registered voters for the 2020 and 2022 general and primary elections for a given census block, 2) the turnout of these registered voters for each election, and 3) race/ethnicity, binned age, and gender counts of the registered voters who reported living in that block as of 2022.
+
+To convert the L2 variables into percentages, I divided each election turnout count by the total number of registered voters in the census block for a given election, and divided the race/ethnicity, binned age, and gender counts by the total number of registered voters who reported living in the block in 2022.
+
+Note that because the registered voter data (L2) is at the census block level, we will aggregate up to the census tract level in order to match the data from ACS. This can easily be done by extracting the census-tract code from the block code, and then summing the count variables across blocks within a given census tract.
+
+## American Community Survey (ACS): 
+
+We obtained census-tract-level data on the *total population* in Maryland in 2022. These census-tract-level data included **median household income** as well as count variables for **work transportation methods** (driving vs. public transportation), **educational attainment** (high school vs bachelors vs graduate), and **unemployment**.
+
+## Load datasets
+```{r}
+# 2022 L2 Registered Voter Turnout and Turnout History Data (block level)
+md2022_voter_turnout <- read.csv(here('../Data/MD_l2_2022stats_2020block/MD_l2_2022stats_2020block.csv')) 
+
+# Census tract demographic data
+combined_tract_data <- read.csv(here('combined_tract_data.csv'))
+
+# Get Maryland county names
+county_names <- get_acs(
+  geography = "county",
+  state = "MD",
+  year = 2022,
+  variables = c(
+    variable = "B19013_001"
+  )) %>%
+  mutate(NAME = substr(NAME,1, nchar(NAME) - 10),
+         fip = GEOID) %>%
+  mutate(county_name = NAME) %>%
+  select(-c(GEOID, NAME, variable, estimate, moe))
+
+# Get median income data (units of $10000) for each county tract
+md_income_data <- get_acs(
+  geography = "tract",
+  variables = "B19013_001",
+  state = "MD",
+  year = 2022,  # Update to the latest available year, if necessary
+  survey = "acs5",  # Use the 5-year estimates
+  geometry = TRUE
+) %>%
+  mutate(tract_id = GEOID,
+         median_income = estimate/1000) %>%
+  select(-c(NAME, GEOID, variable, estimate, moe))
+```
+
+## Join datasets and extract/compute relevant variables
+```{r}
+# make sure join keys are aligned across datasets
+combined_tract_data <- combined_tract_data %>%
+  mutate(tract_id = GEOID) %>%
+  mutate(fip = substr(tract_id, 1,5))
+
+## md2022 data are at block level. We will aggregate up to tract level
+md2022_voter_turnout.tract_level <- md2022_voter_turnout %>%
+  mutate(tract_id = substr(geoid20,1,11)) %>%
+  group_by(tract_id) %>%
+  summarise(across(.cols = where(is.numeric), .fns = sum)) %>%
+  ungroup()
+
+# join all loaded datasets into one dataset
+data_joined <- md2022_voter_turnout.tract_level %>%
+  full_join(combined_tract_data, by = "tract_id") %>%
+  full_join(md_income_data, by = "tract_id") %>%
+  full_join(county_names, by = "fip")
+
+# extract relevant variables from joined dataset
+variables <- c("tract_id", "fip", "county_name", 
+               "age_18_19", "age_20_24", "age_25_29", "age_30_34", "age_35_44", "age_45_54", "age_55_64", 
+               "age_65_74", "age_75_84", "age_85over", 
+               "voters_gender_m", "voters_gender_f", "voters_gender_unknown",
+               "median_income",
+               "Total_Employed", "Total_Unemployed", 
+               "High_School_Graduate", "Total_Education_Population",
+               "Public_Transportation_Users", "Total_Commuters", 
+               "eth1_eur", "eth1_hisp", "eth1_aa", "eth1_esa", "eth1_oth", "eth1_unk",
+               "g20221108_voted_all", "g20221108_reg_all","p20220719_voted_all", "p20220719_reg_all",
+               "g20201103_voted_all", "g20201103_reg_all", "p20200602_voted_all", "p20200602_reg_all", 
+               "geometry")
+
+data_joined.truncated <- data_joined %>%
+  select(all_of(variables))
+
+# rename some variables for easier handling
+data_joined.truncated <- data_joined.truncated %>%
+  mutate(gen2022_voted = g20221108_voted_all,
+         gen2022_reg = g20221108_reg_all,
+         gen2020_voted = g20201103_voted_all,
+         gen2020_reg = g20201103_reg_all,
+         prim2022_voted = p20220719_voted_all,
+         prim2022_reg = p20220719_reg_all,
+         prim2020_voted = p20200602_voted_all,
+         prim2020_reg = p20200602_reg_all) %>%
+  select(-ends_with("all"))
+
+# identify tracts with fewer than 50 registered voters over any election
+data_joined.truncated <- data_joined.truncated %>%
+  mutate(more_than_50 = gen2022_reg > 50 | gen2020_reg > 50 | prim2022_reg > 50 | prim2020_reg > 50)
+
+# calculate percentages
+data_joined.truncated <- data_joined.truncated %>%
+  mutate(pct_over_65 = 100 * (age_65_74 + age_75_84 + age_85over) / (age_18_19 + age_20_24 + age_25_29 + age_30_34 + age_35_44 + age_45_54 + age_55_64 + age_65_74 + age_75_84 + age_85over),
+         pct_male = 100 * voters_gender_m / (voters_gender_f + voters_gender_m + voters_gender_unknown),
+         pct_unemployed = 100 * Total_Unemployed / (Total_Employed + Total_Unemployed),
+         pct_hs = 100 * High_School_Graduate / Total_Education_Population,
+         pct_transit = 100 * Public_Transportation_Users / Total_Commuters,
+         pct_aa = 100 * eth1_aa / (eth1_eur + eth1_hisp + eth1_aa + eth1_esa + eth1_oth + eth1_unk),
+         pct_hisp = 100 * eth1_hisp / (eth1_eur + eth1_hisp + eth1_aa + eth1_esa + eth1_oth + eth1_unk),
+         turnout_gen_2022 = 100 * gen2022_voted / gen2022_reg,
+         turnout_gen_2020 = 100 * gen2020_voted / gen2020_reg,
+         turnout_prim_2022 = 100 * prim2022_voted / prim2022_reg,
+         turnout_prim_2020 = 100 * prim2020_voted / prim2020_reg) %>%
+  select(tract_id, fip, county_name, starts_with("turnout"), median_income, starts_with("pct"), geometry, more_than_50)
+
+# create indicator for census tracts that are in Baltimore City
+data_joined.truncated <- data_joined.truncated %>%
+  mutate(isBmore = ifelse(county_name == "Baltimore city", TRUE, FALSE))
+
+# determine which census tracts are have data for all relevant variables
+data_joined.truncated$complete_case <- data_joined.truncated %>%
+  select(-c(tract_id, fip, county_name, geometry)) %>%
+  complete.cases(.)
+
+# summarized joined dataset
+summary(data_joined.truncated)
+```
+
+
+## Evaluate data missingness
+
+Below, I show all rows in the joined dataset that were missing values for one or more variables. From this summary, we can see that the first 23 rows are missing full block codes, which makes it impossible to determine which census tract they are located in. The remaining 20 rows are missing turnout data or are missing some subset of the demographic variables. Notice that many of the valid census tracts with missing data also have fewer than 50 registered voters in them.
+
+```{r}
+data_joined.truncated %>%
+  filter(complete_case == FALSE)
+```
+
+Below, I've calculated the percentage of tracts within each county that are missing some data.
+```{r}
+data_joined.truncated %>%
+  group_by(county_name) %>%
+  summarize(n_missing = sum(!complete_case), n_total = n(), pct_w_some_missing_data = mean(!complete_case)*100) %>%
+  arrange(desc(pct_w_some_missing_data))
+```
+
+Excluding the first row from the table above, we can see that tract-level data missingness within counties ranges from 21% to 0%, with the majority of counties missing some data for less than 3% of their census tracts.
+
+## Create and summarize complete dataset of census tracts with more than 50 registered voters
+
+The summary of 1454 complete cases (i.e., census tracts with data for all relevant demographic variables) is shown below.
+
+```{r}
+data_joined.complete <- data_joined.truncated %>%
+  filter(complete_case == TRUE & more_than_50 == TRUE)
+
+data_joined.complete.long <- data_joined.complete %>%
+  pivot_longer(cols = turnout_gen_2022:turnout_prim_2020,
+               names_to = "election",
+               values_to = "turnout") %>%
+  mutate(election = case_when(election == "turnout_gen_2022" ~ "gen_2022",
+                              election == "turnout_gen_2020" ~ "gen_2020",
+                              election == "turnout_prim_2022" ~ "prim_2022",
+                              election == "turnout_prim_2020" ~ "prim_2020")) %>%
+  mutate(election_type = ifelse(election %in% c("gen_2022", "gen_2020"), "General", "Primary"),
+         election_year = factor(ifelse(election %in% c("gen_2022", "prim_2022"), 2022, 2020)))
+
+colMeans(data_joined.complete[,4:15])
+apply(data_joined.complete[,4:15], 2, sd)
+```
+
+I've also summarized the dataframe looking only at census tracts in Baltimore City.
+
+```{r}
+summary(data_joined.complete %>% filter(isBmore == TRUE))
+```
+
+# Data Description
+
+Below, I've created a scatterplot matrix to see relationships between each predictor variable in the complete dataframe for all census tracts in Maryland. I've also provided a correlation matrix to show correlations between predictors.
+
+The strongest positive correlations (r = 0.54) is between percentage relying on public transportation (`pct_transit`) and percentage African American (`pct_aa`), and the strongest negative correlations (r = -0.62 and r = -0.58) are between median income (`median_income`) and percent with high school as the highest educational attainment (`pct_hs`), and between percent male (`pct_male`) and `pct_aa`, respectively.
+
+```{r}
+pairs(data_joined.complete %>% select(-c(tract_id, fip, county_name, starts_with("turnout"), geometry, complete_case, more_than_50, isBmore)), cex = 0.1)
+
+ggcorrplot(cor(data_joined.complete %>% select(-c(tract_id, fip, county_name, starts_with("turnout"), geometry, complete_case, more_than_50, isBmore))), type = "lower", lab = TRUE)
+
+```
+
+Below displays the distributions of voter turnouts by County in Maryland. 
+
+```{r}
+turnout_2022_general <- data_joined.complete.long %>%
+  filter(election == "gen_2022") %>%
+  select(county_name, election, turnout) %>%
+  group_by(county_name) %>%
+  summarize(turnout_median = median(turnout)) %>%
+  arrange(turnout_median) %>%
+  select(-turnout_median) %>%
+  as.matrix()
+
+md_county_general_turnout <- data_joined.complete.long %>%
+  filter(election_type == "General") %>%
+  mutate(county_name = factor(county_name, levels = turnout_2022_general)) %>%
+  mutate(election = factor(election, labels = c("2020 General", "2022 General"))) %>%
+  ggplot(aes(x = county_name, y = turnout, color = election)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 50), linetype = "dotted") +
+  geom_hline(aes(yintercept = 100)) +
+  geom_boxplot(outliers = FALSE) +
+  #stat_summary(fun = mean, color = "black", size = 0.3) +
+  labs(title = "County-level Turnout for the 2020/2022 Maryland General Election", x = "", y = "Turnout (%)") +
+  #ylim(0,0.9) +
+  theme_minimal() +
+  scale_x_discrete(expand = c(0.05, 0.05)) +
+  theme(axis.text.x = element_text(angle = 90))
+
+md_county_primary_turnout <- data_joined.complete.long %>%
+  mutate(county_name = factor(county_name, levels = turnout_2022_general)) %>%
+  filter(election_type == "Primary") %>%
+  mutate(election = factor(election, labels = c("2020 Primary", "2022 Primary"))) %>%
+  ggplot(aes(x = county_name, y = turnout, color = election)) +
+  geom_hline(aes(yintercept = 50), linetype = "dotted") +
+  geom_boxplot(outliers = FALSE) +
+  #stat_summary(fun = mean, color = "black", size = 0.3) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 100)) +
+  labs(title = "County-level Turnout for the 2020/2022 Maryland Primary Election", x = "", y = "Turnout (%)") +
+  #ylim(0,0.9) +
+  theme_minimal() +
+  scale_x_discrete(expand = c(0.05, 0.05)) +
+  theme(axis.text.x = element_text(angle = 90))
+
+md_county_general_turnout
+md_county_primary_turnout
+```
+
+Below is a visual summary of the distribution of tract-level voter turnouts for each election among complete cases in Maryland and Baltimore City. It also shows the change in voter turnout from 2022 to 2020 within each census tract. Before making this plot, I reformatted the dataframe into long format.
+
+```{r}
+data_joined.complete.long %>%
+  ggplot(aes(x = election_year, y = turnout, fill = election_year)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_violinhalf(flip = c(1,3)) +
+  geom_boxplot(aes(fill = NULL), width = 0.2) +
+  geom_point(alpha = 0.3) +
+  geom_line(aes(fill = NULL, group = tract_id), alpha = 0.05) +
+  stat_summary(fun = mean, size = 0.3) +
+  facet_wrap(~election_type) +
+  labs(title = "Registered Voter Turnout by Election Type and Year in Maryland", x = "Election Year", y = "Voter Turnout (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+data_joined.complete.long %>%
+  filter(isBmore == TRUE) %>%
+  ggplot(aes(x = election_year, y = turnout, fill = election_year)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_violinhalf(flip = c(1,3)) +
+  geom_boxplot(aes(fill = NULL), width = 0.2) +
+  geom_point(alpha = 0.3) +
+  geom_line(aes(fill = NULL, group = tract_id), alpha = 0.2) +
+  stat_summary(fun = mean, size = 0.3) +
+  facet_wrap(~election_type) +
+  labs(title = "Registered Voter Turnout by Election Type and Year in Baltimore City", x = "Election Year", y = "Voter Turnout (%)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+I also looked at the spatial distribution of voter turnout and change in voter turnout across election years in Baltimore City.
+
+```{r}
+# Voter turnout general elections
+bcity_general_turnout_map <- data_joined.complete.long %>%
+  filter(isBmore == TRUE,
+         election_type == "General") %>%
+  ggplot(aes(fill = turnout)) + 
+  geom_sf(aes(geometry = geometry), color = NA) +
+  scale_fill_viridis_c(option = "magma") +
+  facet_wrap(~election_year) +
+  labs(title = "General Election Turnout in Baltimore City",
+       fill = "Turnout (%)") +
+  theme_minimal() + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Percent change in general election voter turnout from 2020 to 2022
+bcity_general_diff_map <- data_joined.complete.long %>%
+  filter(isBmore == TRUE,
+         election_type == "General") %>%
+  pivot_wider(names_from = c(election, election_year, election_type),
+              values_from = turnout) %>%
+  mutate(pct_change = 100 * (gen_2022_2022_General - gen_2020_2020_General) / gen_2020_2020_General) %>%
+  ggplot(aes(fill = pct_change)) + 
+  geom_sf(aes(geometry = geometry), color = NA) +
+  scale_fill_viridis_c(option = "magma") +
+  labs(title = "Percent Change in General Election Turnout \nfrom 2020 to 2022 in Baltimore City",
+       fill = "Percent Change") +
+  theme_minimal() + 
+  theme(plot.title = element_text(size = 10, hjust = 0.5))
+
+# Voter turnout primary elections
+bcity_primary_turnout_map <- data_joined.complete.long %>%
+  filter(isBmore == TRUE,
+         election_type == "Primary") %>%
+  ggplot(aes(fill = turnout)) + 
+  geom_sf(aes(geometry = geometry), color = NA) +
+  scale_fill_viridis_c(option = "magma") +
+  facet_wrap(~election_year) +
+  labs(title = "Primary Election Turnout in Baltimore City",
+       fill = "Turnout (%)") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# Percent change in primary election voter turnout from 2020 to 2022
+bcity_primary_diff_map <- data_joined.complete.long %>%
+  filter(isBmore == TRUE,
+         election_type == "Primary") %>%
+  pivot_wider(names_from = c(election, election_year, election_type),
+              values_from = turnout) %>%
+  mutate(pct_change = 100 * (prim_2022_2022_Primary - prim_2020_2020_Primary) / prim_2020_2020_Primary) %>%
+  ggplot(aes(fill = pct_change)) + 
+  geom_sf(aes(geometry = geometry), color = NA) +
+  scale_fill_viridis_c(option = "magma") +
+  labs(title = "Percent Change in Primary Election Turnout \nfrom 2020 to 2022 in Baltimore City",
+       fill = "Percent Change") +
+  theme_minimal() +
+  theme(plot.title = element_text(size = 10, hjust = 0.5))
+
+bcity_general_turnout_map / bcity_primary_turnout_map
+bcity_general_diff_map / bcity_primary_diff_map
+
+```
+
+These plots suggest that Baltimore City voter turnouts (and changes in turnouts over time) very much follow the "Black butterfly" pattern. That is, majority black neighborhoods tended to show lower election turnouts in 2020 compared to other neighborhoods in Baltimore City. On top of this, majority black neighborhoods had steeper decreases in voter turnouts from 2020 to 2022 compared to other neighborhoods in Baltimore City. 
+
+Finally, I produced some plots to visualize unadjusted marginal relationships between voter turnout and each of the predictor variables.
+
+```{r}
+data_joined.complete.extra_long <- data_joined.complete.long %>%
+  pivot_longer(cols = median_income:pct_hisp, names_to = "Variable", values_to = "Value")
+
+data_joined.complete.extra_long %>%
+  filter(election_type == "General") %>%
+  ggplot(aes(x = Value, y = turnout/100, color = election_year)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(aes(group = election_year), color = "black", method = "loess") +
+  geom_smooth(aes(group = election_year), method = "lm") +
+  facet_wrap(~Variable, scales = "free") +
+  labs(title = "Predictors of Voter Turnout in Maryland General Elections",
+       y = "Voter Turnout (%)",
+       x = "Predictor Value") +
+  theme_bw()
+
+data_joined.complete.extra_long %>%
+  filter(election_type == "Primary") %>%
+  ggplot(aes(x = Value, y = turnout/100, color = election_year)) +
+  geom_point(alpha = 0.05) +
+  geom_smooth(aes(group = election_year), color = "black", method = "loess") +
+  geom_smooth(aes(group = election_year), method = "lm") +
+  facet_wrap(~Variable, scales = "free") +
+  labs(title = "Predictors of Voter Turnout in Maryland Primary Elections",
+       y = "Voter Turnout (%)",
+       x = "Predictor Value") +
+  theme_bw()
+```
+
+For general elections, median income appears to have a particularly non-linear association with voter turnout percentage; the slope is steeper from 0 - 75 compared to from >75 - 250. Therefore, I will use a linear spline with a knot at 75 to model this relationship when fitting future models. While the other variables show varying levels of deviation from linearity when plotted against voter turnout, I will refrain from using splines for these variables in efforts to avoid overfitting. Future analyses should consider further exploring these non-linearities, as it would be interesting to see if they persist over multiple (more than 2) election cycles.
+
+For primary elections, most variables should relatively linear relationships with voter turnout percentages. In efforts to be consistent with the analysis on general elections, I will also use a linear spline with a knot at 75 to model the relationship between median income and voter turnout.
+
+# Model Fitting
+
+This portion of the analysis is dedicated to estimating adjusted effects of the demographic variables explored above on voter turnouts from 2020 to 2022 for primary and general elections.
+
+As stated in the data description section, I want to model the relationship between median income and voter turnout using a linear spline with one knot at 75. I create this linear spline below.
+
+```{r}
+# consolidate variables for general election models
+dat.gen <- data_joined.complete.long %>%
+  filter(election_type == "General") %>%
+  select(tract_id, county_name, turnout, election, isBmore, median_income, pct_over_65, pct_male, pct_unemployed, pct_hs, pct_transit, pct_aa, pct_hisp) %>%
+  mutate(median_income_sp1 = ifelse(median_income > 75, median_income - 75, 0))
+
+# make a standardized dataset
+mean.inc.gen <- mean(dat.gen$median_income)
+sd.inc.gen <- sd(dat.gen$median_income)
+knot.inc.gen.st <- (75 - mean.inc.gen)/sd.inc.gen
+
+dat.gen.st <- dat.gen %>%
+  select(tract_id, county_name, turnout, election, isBmore, median_income, pct_over_65, pct_male, pct_unemployed, pct_hs, pct_transit, pct_aa, pct_hisp) %>%
+  mutate(turnout = scale(turnout),
+         median_income = scale(median_income),
+         pct_over_65 = scale(pct_over_65),
+         pct_male = scale(pct_male),
+         pct_unemployed = scale(pct_unemployed),
+         pct_hs = scale(pct_hs),
+         pct_transit = scale(pct_transit),
+         pct_aa = scale(pct_aa),
+         pct_hisp = scale(pct_hisp)) %>%
+  mutate(median_income_sp1 = ifelse(median_income > knot.inc.gen.st, median_income - knot.inc.gen.st, 0))
+
+# consolidate variables for primary election models
+dat.prim <- data_joined.complete.long %>%
+  filter(election_type == "Primary") %>%
+  select(tract_id, county_name, turnout, election, isBmore, median_income, pct_over_65, pct_male, pct_unemployed, pct_hs, pct_transit, pct_aa, pct_hisp) %>%
+  mutate(median_income_sp1 = ifelse(median_income > 75, median_income - 75, 0))
+
+# make a standardized dataset
+mean.inc.prim <- mean(dat.prim$median_income)
+sd.inc.prim <- sd(dat.prim$median_income)
+knot.inc.prim.st <- (75 - mean.inc.prim)/sd.inc.prim
+
+dat.prim.st <- dat.prim %>%
+  select(tract_id, county_name, turnout, election, isBmore, median_income, pct_over_65, pct_male, pct_unemployed, pct_hs, pct_transit, pct_aa, pct_hisp) %>%
+  mutate(turnout = scale(turnout),
+         median_income = scale(median_income),
+         pct_over_65 = scale(pct_over_65),
+         pct_male = scale(pct_male),
+         pct_unemployed = scale(pct_unemployed),
+         pct_hs = scale(pct_hs),
+         pct_transit = scale(pct_transit),
+         pct_aa = scale(pct_aa),
+         pct_hisp = scale(pct_hisp)) %>%
+  mutate(median_income_sp1 = ifelse(median_income > knot.inc.prim.st, median_income - knot.inc.prim.st, 0))
+```
+
+I also wrote a function that gets 95% confidence intervals for linear combinations of fixed effects estimates in lme models.
+
+```{r}
+confint.lme <- function(mod, ind, alpha) {
+  
+  coefs <- summary(mod)$coefficients %>%
+    as.data.frame() %>%
+    select(Estimate)
+
+  z_crit <- qnorm(1-(alpha/2)) # assumes sample size is large enough to use z instead of t distribution
+  cov_mat <- vcov(mod)
+
+  outp <- matrix(rep(NA,ncol(ind)*3), nrow = ncol(ind))
+  
+  for (j in 1:ncol(ind)) {
+    
+    tmp.ind <- ind[,j]
+    tmp.est <- t(coefs) %*% tmp.ind
+    tmp.se <- sqrt(diag(t(tmp.ind) %*% cov_mat %*% tmp.ind))
+    tmp.ci <- c(tmp.est - z_crit*tmp.se, tmp.est + z_crit*tmp.se)
+    
+    outp[j,1] <- tmp.est[1]
+    outp[j,2:3] <- tmp.ci
+    
+  }
+  
+  return(outp)
+
+}
+```
+
+
+## General elections
+
+### Single predictor models (LME)
+
+Below I fit univariate LME models for each predictor on voter turnout by election year and `isBmore` status. I included random intercepts for census tracts nested within counties. A summary table of the unadjusted coefficient estimates are shown after this code block.
+
+```{r}
+################ median income ################
+# fit model
+gen_lme.unadj.medinc <- lmer(turnout ~ election*isBmore*(median_income + median_income_sp1) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.medinc.summary <- summary(gen_lme.unadj.medinc)
+ncoef <- nrow(gen_lme.unadj.medinc.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*8), nrow = ncoef, ncol = 8)
+ind[4,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(4,7),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(4,7,9),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(4,7,9,11),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(4,5),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(4,5,7,8),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(4,5,9:10),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(4,5,7:12),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.medinc <- confint.lme(gen_lme.unadj.medinc, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.medinc) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+gen_ci.unadj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+gen_ci.unadj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+
+# fit model
+gen_lme.unadj.over65 <- lmer(turnout ~ election*isBmore*(pct_over_65) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.over65.summary <- summary(gen_lme.unadj.over65)
+ncoef <- nrow(gen_lme.unadj.over65.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.over65 <- confint.lme(gen_lme.unadj.over65, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.over65) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.over65$variable <- c(rep("pct_over_65", 4))
+gen_ci.unadj.over65$bmore <- c(0,0,1,1)
+gen_ci.unadj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+
+# fit model
+gen_lme.unadj.pctmale <- lmer(turnout ~ election*isBmore*(pct_male) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pctmale.summary <- summary(gen_lme.unadj.pctmale)
+ncoef <- nrow(gen_lme.unadj.pctmale.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pctmale <- confint.lme(gen_lme.unadj.pctmale, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pctmale) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pctmale$variable <- c(rep("pct_male", 4))
+gen_ci.unadj.pctmale$bmore <- c(0,0,1,1)
+gen_ci.unadj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+
+# fit model
+gen_lme.unadj.pctunemp <- lmer(turnout ~ election*isBmore*(pct_unemployed) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pctunemp.summary <- summary(gen_lme.unadj.pctunemp)
+ncoef <- nrow(gen_lme.unadj.pctunemp.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pctunemp <- confint.lme(gen_lme.unadj.pctunemp, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pctunemp) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+gen_ci.unadj.pctunemp$bmore <- c(0,0,1,1)
+gen_ci.unadj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+
+# fit model
+gen_lme.unadj.pcths <- lmer(turnout ~ election*isBmore*(pct_hs) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pcths.summary <- summary(gen_lme.unadj.pcths)
+ncoef <- nrow(gen_lme.unadj.pcths.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pcths <- confint.lme(gen_lme.unadj.pcths, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pcths) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pcths$variable <- c(rep("pct_hs", 4))
+gen_ci.unadj.pcths$bmore <- c(0,0,1,1)
+gen_ci.unadj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+
+# fit model
+gen_lme.unadj.pcttransit <- lmer(turnout ~ election*isBmore*(pct_transit) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pcttransit.summary <- summary(gen_lme.unadj.pcttransit)
+ncoef <- nrow(gen_lme.unadj.pcttransit.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pcttransit <- confint.lme(gen_lme.unadj.pcttransit, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pcttransit) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pcttransit$variable <- c(rep("pct_transit", 4))
+gen_ci.unadj.pcttransit$bmore <- c(0,0,1,1)
+gen_ci.unadj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+
+# fit model
+gen_lme.unadj.pctaa <- lmer(turnout ~ election*isBmore*(pct_aa) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pctaa.summary <- summary(gen_lme.unadj.pctaa)
+ncoef <- nrow(gen_lme.unadj.pctaa.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pctaa<- confint.lme(gen_lme.unadj.pctaa, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pctaa) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pctaa$variable <- c(rep("pct_aa", 4))
+gen_ci.unadj.pctaa$bmore <- c(0,0,1,1)
+gen_ci.unadj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+
+# fit model
+gen_lme.unadj.pcthisp <- lmer(turnout ~ election*isBmore*(pct_hisp) + (1|county_name/tract_id), dat = dat.gen)
+
+# get model summary
+gen_lme.unadj.pcthisp.summary <- summary(gen_lme.unadj.pcthisp)
+ncoef <- nrow(gen_lme.unadj.pcthisp.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+gen_ci.unadj.pcthisp <- confint.lme(gen_lme.unadj.pcthisp, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(gen_ci.unadj.pcthisp) <- c("Est", "Lower", "Upper")
+gen_ci.unadj.pcthisp$variable <- c(rep("pct_hisp", 4))
+gen_ci.unadj.pcthisp$bmore <- c(0,0,1,1)
+gen_ci.unadj.pcthisp$year <- rep(c(2020,2022), 2)
+```
+
+I've created a table displaying the unadjusted parameter estimates below:
+
+```{r}
+gen_ci.unadj <- rbind(gen_ci.unadj.medinc, gen_ci.unadj.over65, gen_ci.unadj.pctaa, gen_ci.unadj.pcthisp,
+                  gen_ci.unadj.pcths, gen_ci.unadj.pctmale, gen_ci.unadj.pcttransit, gen_ci.unadj.pctunemp)
+
+gen_ci.unadj[,1:3] <- round(gen_ci.unadj[,1:3],3)
+gen_ci.unadj
+```
+
+### Adjusted model (LME)
+
+```{r}
+# fit adjusted model for general elections
+gen_lme.adj <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.gen)
+
+gen_lme.adj.summary <- summary(gen_lme.adj)
+gen_lme.adj.summary
+
+# fit standardized adjusted model for general elections
+gen_lme.adj.st <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.gen.st)
+
+gen_lme.adj.st.summary <- summary(gen_lme.adj.st)
+gen_lme.adj.st.summary
+```
+
+#### Diagnostics
+
+I want to evaluate the fit of the (standardized) LME model and assess its sensitivity to outliers and influential points.
+
+Step 1) Plot residuals against fitted values from standardized adjusted model.
+
+```{r}
+plot(gen_lme.adj) 
+qqnorm(resid(gen_lme.adj))
+qqline(resid(gen_lme.adj))
+```
+
+Step 2) Identify census tracts with the largest residuals
+
+```{r}
+dat.gen.st$scaled_res <- gen_lme.adj.st.summary$residuals
+dat.gen.st$fitted <- predict(gen_lme.adj.st, dat.gen.st, re.form = NULL)
+
+dat.gen.st %>%
+  select(tract_id, county_name, turnout, fitted, scaled_res) %>%
+  arrange(desc(abs(scaled_res))) %>%
+  head(15)
+```
+
+Step 2) Use Cook's distance to identify influential data points.
+
+```{r}
+dat.gen.st$cooks_distance <- cooks.distance(gen_lme.adj.st)
+
+# identify most influential points
+dat.gen.st %>%
+  arrange(desc(cooks_distance)) %>%
+  select(tract_id, county_name, election, cooks_distance, fitted, scaled_res) %>%
+  head()
+```
+
+Step 3) Compare model excluding the most influential census tracts to the original model
+
+I will now refit the standardized lme model excluding the 2 census tracts with cooks distance > 0.5, and compare it to the original model fit.
+
+```{r}
+tracts_to_exclude <- c(24033980000, 24005492500)
+dat.gen.st.ex <- dat.gen.st %>%
+  filter(!tract_id %in% tracts_to_exclude)
+
+# refit model
+gen_lme.adj.st.ex <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.gen.st.ex)
+
+gen_lme.adj.st.ex.summary <- summary(gen_lme.adj.st.ex)
+
+# compare new coefficient estimates with original ones
+gen_lme.adj.st.t <- round(cbind(gen_lme.adj.st.summary$coefficients[,c(1,5)],
+                           gen_lme.adj.st.ex.summary$coefficients[,c(1,5)]),3)
+
+gen_lme.adj.st.t
+```
+
+We can see that, while the estimates do change a tiny bit after removing the 2 influential census tracts, our key inferences from the model remain almost entirely the same, suggesting robustness to the inclusion of these census tracts.
+
+### Model Summary
+
+#### Unstandardized Model
+
+```{r}
+gen_lme.adj.coefs <- summary(gen_lme.adj)$coefficients %>%
+  as.data.frame() %>%
+  select(Estimate)
+
+gen_lme.adj.coefs$idx <- 1:nrow(gen_lme.adj.coefs)
+gen_lme.adj.coefs
+
+################ median income ################
+
+# isbmore and gen_2020
+ind <- matrix(0,nrow=nrow(gen_lme.adj.coefs),ncol=8)
+ind[7,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(7,26),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(7,17),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(7,17,26,35),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(7,8),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(7,8,26,27),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(7,8,17,18),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(7,8,17,18,26,27,35,36),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.medinc <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.medinc) <- c("Est", "Lower", "Upper")
+ci.adj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+ci.adj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+ci.adj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[9,1] <- 1 # !bmore & 2020
+ind[c(9,28),2] <- 1 # !bmore & 2022
+ind[c(9,19),3] <- 1 # bmore & 2020
+ind[c(9,19,28,37),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.over65 <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.over65) <- c("Est", "Lower", "Upper")
+ci.adj.over65$variable <- c(rep("pct_over_65", 4))
+ci.adj.over65$bmore <- c(0,0,1,1)
+ci.adj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[6,1] <- 1 # !bmore & 2020
+ind[c(6,25),2] <- 1 # !bmore & 2022
+ind[c(6,16),3] <- 1 # bmore & 2020
+ind[c(6,16,25,34),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctmale <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctmale) <- c("Est", "Lower", "Upper")
+ci.adj.pctmale$variable <- c(rep("pct_male", 4))
+ci.adj.pctmale$bmore <- c(0,0,1,1)
+ci.adj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[10,1] <- 1 # !bmore & 2020
+ind[c(10,29),2] <- 1 # !bmore & 2022
+ind[c(10,20),3] <- 1 # bmore & 2020
+ind[c(10,20,29,38),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctunemp <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctunemp) <- c("Est", "Lower", "Upper")
+ci.adj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+ci.adj.pctunemp$bmore <- c(0,0,1,1)
+ci.adj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[11,1] <- 1 # !bmore & 2020
+ind[c(11,30),2] <- 1 # !bmore & 2022
+ind[c(11,21),3] <- 1 # bmore & 2020
+ind[c(11,21,30,39),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcths <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcths) <- c("Est", "Lower", "Upper")
+ci.adj.pcths$variable <- c(rep("pct_hs", 4))
+ci.adj.pcths$bmore <- c(0,0,1,1)
+ci.adj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[12,1] <- 1 # !bmore & 2020
+ind[c(12,31),2] <- 1 # !bmore & 2022
+ind[c(12,22),3] <- 1 # bmore & 2020
+ind[c(12,22,31,40),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcttransit <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcttransit) <- c("Est", "Lower", "Upper")
+ci.adj.pcttransit$variable <- c(rep("pct_transit", 4))
+ci.adj.pcttransit$bmore <- c(0,0,1,1)
+ci.adj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,23),2] <- 1 # !bmore & 2022
+ind[c(4,14),3] <- 1 # bmore & 2020
+ind[c(4,14,23,32),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctaa <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctaa) <- c("Est", "Lower", "Upper")
+ci.adj.pctaa$variable <- c(rep("pct_aa", 4))
+ci.adj.pctaa$bmore <- c(0,0,1,1)
+ci.adj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.coefs), ncol = 4)
+ind[5,1] <- 1 # !bmore & 2020
+ind[c(5,24),2] <- 1 # !bmore & 2022
+ind[c(5,15),3] <- 1 # bmore & 2020
+ind[c(5,15,24,33),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcthisp <- confint.lme(gen_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcthisp) <- c("Est", "Lower", "Upper")
+ci.adj.pcthisp$variable <- c(rep("pct_hisp", 4))
+ci.adj.pcthisp$bmore <- c(0,0,1,1)
+ci.adj.pcthisp$year <- rep(c(2020,2022), 2)
+
+################ combine tables ################
+gen_ci.adj <- rbind(ci.adj.medinc, ci.adj.over65, ci.adj.pctaa, ci.adj.pcthisp,
+                  ci.adj.pcths, ci.adj.pctmale, ci.adj.pcttransit, ci.adj.pctunemp)
+
+gen_ci.adj[,1:3] <- round(gen_ci.adj[,1:3],3)
+gen_ci.adj
+```
+
+```{r}
+# define controls for plotting model fits
+bmore_dat <- dat.gen %>%
+  filter(isBmore == 1, election == "gen_2020")
+
+controls <- bmore_dat %>%
+  summarize(med_median_income = median(median_income),
+            max_median_income = max(median_income),
+            min_median_income = min(median_income),
+            med_pct_aa = median(pct_aa),
+            max_pct_aa = max(pct_aa),
+            min_pct_aa = min(pct_aa),
+            med_pct_hisp = median(pct_hisp),
+            max_pct_hisp = max(pct_hisp),
+            min_pct_hisp = min(pct_hisp),
+            med_pct_over_65 = median(pct_over_65),
+            max_pct_over_65 = max(pct_over_65),
+            min_pct_over_65 = min(pct_over_65),
+            med_pct_male = median(pct_male),
+            max_pct_male = max(pct_male),
+            min_pct_male = min(pct_male),
+            med_pct_unemployed = median(pct_unemployed),
+            max_pct_unemployed = max(pct_unemployed),
+            min_pct_unemployed = min(pct_unemployed),
+            med_pct_hs = median(pct_hs),
+            max_pct_hs = max(pct_hs),
+            min_pct_hs = min(pct_hs),
+            med_pct_transit = median(pct_transit),
+            max_pct_transit = max(pct_transit),
+            min_pct_transit = min(pct_transit))
+
+controls
+```
+
+I wrote a function below for getting synthetic data for plotting model fits.
+
+```{r}
+get_new_data <- function(controls, variable, elections, knot) {
+  
+  if (missing(knot)) {
+    knot = 75
+  }
+  
+  medians <- controls %>%
+    select(starts_with("med") & !contains(variable)) %>%
+    as.matrix()
+  
+  variable_controls <- controls %>%
+    select(contains(variable)) %>%
+    as.matrix()
+  
+  variable_names <- controls %>%
+    select(starts_with("med") & !contains(variable)) %>%
+    colnames()
+  
+  variable_names <- substring(variable_names,5)
+  
+  new_data <- expand.grid(
+    election = elections,
+    isBmore = c(TRUE,FALSE),
+    var1 = seq(variable_controls[1,3], variable_controls[1,2], length.out = 50),
+    var2 = medians[1],
+    var3 = medians[2],
+    var4 = medians[3],
+    var5 = medians[4],
+    var6 = medians[5],
+    var7 = medians[6],
+    var8 = medians[7]
+  ) %>%
+    mutate(election = factor(election),
+           isBmore = factor(isBmore))
+  
+  colnames(new_data)[3:10] <- c(variable, variable_names)
+  
+  if (variable == "median_income") {
+    new_data$median_income_sp1 <- ifelse(new_data$median_income > knot, 
+                                         new_data$median_income - knot, 0)
+  } else if (medians[1,"med_median_income"] > knot) {
+    new_data$median_income_sp1 <- medians[1,"med_median_income"] - knot
+  } else {
+    new_data$median_income_sp1 <- 0
+  }
+  
+  return(new_data)
+  
+}
+```
+
+```{r}
+# general elections
+
+################ median income ################
+new_data.medinc <- get_new_data(controls, "median_income", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.medinc, re.form = NA, se.fit=TRUE)
+
+new_data.medinc$fitted <- pred$fit
+new_data.medinc$se <- pred$se.fit
+new_data.medinc$variable <- "Median Income"
+new_data.medinc <- new_data.medinc %>%
+  mutate(value = median_income) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ over 65 ################
+new_data.over65 <- get_new_data(controls, "pct_over_65", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.over65, re.form = NA, se.fit=TRUE)
+
+new_data.over65$fitted <- pred$fit
+new_data.over65$se <- pred$se.fit
+new_data.over65$variable <- "% Over 65"
+new_data.over65 <- new_data.over65 %>%
+  mutate(value = pct_over_65) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent male ################
+new_data.pctmale <- get_new_data(controls, "pct_male", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pctmale, re.form = NA, se.fit=TRUE)
+
+new_data.pctmale$fitted <- pred$fit
+new_data.pctmale$se <- pred$se.fit
+new_data.pctmale$variable <- "% Male"
+new_data.pctmale <- new_data.pctmale %>%
+  mutate(value = pct_male) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent unemployed ################
+new_data.pctunemp <- get_new_data(controls, "pct_unemployed", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pctunemp, re.form = NA, se.fit=TRUE)
+
+new_data.pctunemp$fitted <- pred$fit
+new_data.pctunemp$se <- pred$se.fit
+new_data.pctunemp$variable <- "% Unemployed"
+new_data.pctunemp <- new_data.pctunemp%>%
+  mutate(value = pct_unemployed) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent high school attainment ################
+new_data.pcths <- get_new_data(controls, "pct_hs", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pcths, re.form = NA, se.fit=TRUE)
+
+new_data.pcths$fitted <- pred$fit
+new_data.pcths$se <- pred$se.fit
+new_data.pcths$variable <- "% High School"
+new_data.pcths <- new_data.pcths %>%
+  mutate(value = pct_hs) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent relying on public transit ################
+new_data.pcttransit <- get_new_data(controls, "pct_transit", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pcttransit, re.form = NA, se.fit=TRUE)
+
+new_data.pcttransit$fitted <- pred$fit
+new_data.pcttransit$se <- pred$se.fit
+new_data.pcttransit$variable <- "% Public Transit"
+new_data.pcttransit <- new_data.pcttransit %>%
+  mutate(value = pct_transit) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent African American ################
+new_data.pctaa <- get_new_data(controls, "pct_aa", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pctaa, re.form = NA, se.fit=TRUE)
+
+new_data.pctaa$fitted <- pred$fit
+new_data.pctaa$se <- pred$se.fit
+new_data.pctaa$variable <- "% African American"
+new_data.pctaa <- new_data.pctaa %>%
+  mutate(value = pct_aa) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent hispanic ################
+new_data.pcthisp <- get_new_data(controls, "pct_hisp", c("gen_2020", "gen_2022"))
+
+pred <- predict(gen_lme.adj, new_data.pcthisp, re.form = NA, se.fit=TRUE)
+
+new_data.pcthisp$fitted <- pred$fit
+new_data.pcthisp$se <- pred$se.fit
+new_data.pcthisp$variable <- "% Hispanic"
+new_data.pcthisp <- new_data.pcthisp %>%
+  mutate(value = pct_hisp) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ combine data frames ################
+new_data <- rbind(new_data.pctaa, new_data.pcthisp, new_data.pcths,
+                  new_data.pctmale, new_data.pcttransit, new_data.pctunemp,
+                  new_data.medinc, new_data.over65)
+
+# calculate confidence intervals
+new_data <- new_data %>%
+  mutate(lower = fitted - 1.96*se, upper = fitted + 1.96*se)
+```
+
+Plot model fits
+```{r}
+gen_lme.plot.2020 <- new_data %>%
+  filter(election == "gen_2020") %>%
+  ggplot(aes(x = value, y = fitted, color = isBmore)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_line() +
+  geom_hline(aes(yintercept = 0)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = isBmore, color = NULL), alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 85)) +
+  facet_wrap(~variable, scale = "free_x") + 
+  labs(title = "Adjusted Model Fits for General 2020 Election") + 
+  theme_bw()
+
+gen_lme.plot.2022 <- new_data %>%
+  filter(election == "gen_2022") %>%
+  ggplot(aes(x = value, y = fitted, color = isBmore)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = isBmore, color = NULL), alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 85)) +
+  facet_wrap(~variable, scale = "free_x") + 
+  labs(title = "Adjusted Model Fits for General 2022 Election") + 
+  theme_bw()
+
+gen_lme.plot.2020
+gen_lme.plot.2022
+```
+
+#### Standardized Model
+
+```{r}
+gen_lme.adj.st.coefs <- summary(gen_lme.adj.st)$coefficients %>%
+  as.data.frame() %>%
+  select(Estimate)
+
+gen_lme.adj.st.coefs$idx <- 1:nrow(gen_lme.adj.st.coefs)
+gen_lme.adj.st.coefs
+
+################ median income ################
+
+# isbmore and gen_2020
+ind <- matrix(0,nrow=nrow(gen_lme.adj.st.coefs),ncol=8)
+ind[7,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(7,26),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(7,17),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(7,17,26,35),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(7,8),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(7,8,26,27),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(7,8,17,18),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(7,8,17,18,26,27,35,36),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.medinc <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.medinc) <- c("Est", "Lower", "Upper")
+ci.adj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+ci.adj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+ci.adj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[9,1] <- 1 # !bmore & 2020
+ind[c(9,28),2] <- 1 # !bmore & 2022
+ind[c(9,19),3] <- 1 # bmore & 2020
+ind[c(9,19,28,37),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.over65 <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.over65) <- c("Est", "Lower", "Upper")
+ci.adj.over65$variable <- c(rep("pct_over_65", 4))
+ci.adj.over65$bmore <- c(0,0,1,1)
+ci.adj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[6,1] <- 1 # !bmore & 2020
+ind[c(6,25),2] <- 1 # !bmore & 2022
+ind[c(6,16),3] <- 1 # bmore & 2020
+ind[c(6,16,25,34),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctmale <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctmale) <- c("Est", "Lower", "Upper")
+ci.adj.pctmale$variable <- c(rep("pct_male", 4))
+ci.adj.pctmale$bmore <- c(0,0,1,1)
+ci.adj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[10,1] <- 1 # !bmore & 2020
+ind[c(10,29),2] <- 1 # !bmore & 2022
+ind[c(10,20),3] <- 1 # bmore & 2020
+ind[c(10,20,29,38),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctunemp <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctunemp) <- c("Est", "Lower", "Upper")
+ci.adj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+ci.adj.pctunemp$bmore <- c(0,0,1,1)
+ci.adj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[11,1] <- 1 # !bmore & 2020
+ind[c(11,30),2] <- 1 # !bmore & 2022
+ind[c(11,21),3] <- 1 # bmore & 2020
+ind[c(11,21,30,39),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcths <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcths) <- c("Est", "Lower", "Upper")
+ci.adj.pcths$variable <- c(rep("pct_hs", 4))
+ci.adj.pcths$bmore <- c(0,0,1,1)
+ci.adj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[12,1] <- 1 # !bmore & 2020
+ind[c(12,31),2] <- 1 # !bmore & 2022
+ind[c(12,22),3] <- 1 # bmore & 2020
+ind[c(12,22,31,40),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcttransit <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcttransit) <- c("Est", "Lower", "Upper")
+ci.adj.pcttransit$variable <- c(rep("pct_transit", 4))
+ci.adj.pcttransit$bmore <- c(0,0,1,1)
+ci.adj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,23),2] <- 1 # !bmore & 2022
+ind[c(4,14),3] <- 1 # bmore & 2020
+ind[c(4,14,23,32),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctaa <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctaa) <- c("Est", "Lower", "Upper")
+ci.adj.pctaa$variable <- c(rep("pct_aa", 4))
+ci.adj.pctaa$bmore <- c(0,0,1,1)
+ci.adj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(gen_lme.adj.st.coefs), ncol = 4)
+ind[5,1] <- 1 # !bmore & 2020
+ind[c(5,24),2] <- 1 # !bmore & 2022
+ind[c(5,15),3] <- 1 # bmore & 2020
+ind[c(5,15,24,33),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcthisp <- confint.lme(gen_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcthisp) <- c("Est", "Lower", "Upper")
+ci.adj.pcthisp$variable <- c(rep("pct_hisp", 4))
+ci.adj.pcthisp$bmore <- c(0,0,1,1)
+ci.adj.pcthisp$year <- rep(c(2020,2022), 2)
+
+################ combine tables ################
+gen_ci.adj.st <- rbind(ci.adj.medinc, ci.adj.over65, ci.adj.pctaa, ci.adj.pcthisp,
+                  ci.adj.pcths, ci.adj.pctmale, ci.adj.pcttransit, ci.adj.pctunemp)
+
+gen_ci.adj.st[,1:3] <- round(gen_ci.adj.st[,1:3],3)
+gen_ci.adj.st
+```
+
+Plot standardized estimates
+```{r}
+gen_ci.adj.st %>%
+  ggplot(aes(x = Est, y = variable)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  geom_point(aes(shape = factor(bmore), color = factor(bmore)),position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper, color = factor(bmore)), height = 0.3, position = position_dodge(width = 0.5)) +
+  labs(title = "Adjusted Standardized Estimates \nfor 2020/2022 General Elections", color = "Is in Baltimore City") +
+  guides(shape = "none") +
+  facet_wrap(~year) +
+  theme_bw()
+```
+
+## Primary elections
+
+### Single predictor models (LME)
+
+```{r}
+################ median income ################
+# fit model
+prim_lme.unadj.medinc <- lmer(turnout ~ election*isBmore*(median_income + median_income_sp1) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.medinc.summary <- summary(prim_lme.unadj.medinc)
+ncoef <- nrow(prim_lme.unadj.medinc.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*8), nrow = ncoef, ncol = 8)
+ind[4,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(4,7),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(4,7,9),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(4,7,9,11),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(4,5),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(4,5,7,8),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(4,5,9:10),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(4,5,7:12),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.medinc <- confint.lme(prim_lme.unadj.medinc, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.medinc) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+prim_ci.unadj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+prim_ci.unadj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+# fit model
+prim_lme.unadj.over65 <- lmer(turnout ~ election*isBmore*(pct_over_65) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.over65.summary <- summary(prim_lme.unadj.over65)
+ncoef <- nrow(prim_lme.unadj.over65.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.over65 <- confint.lme(prim_lme.unadj.over65, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.over65) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.over65$variable <- c(rep("pct_over_65", 4))
+prim_ci.unadj.over65$bmore <- c(0,0,1,1)
+prim_ci.unadj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+# fit model
+prim_lme.unadj.pctmale <- lmer(turnout ~ election*isBmore*(pct_male) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pctmale.summary <- summary(prim_lme.unadj.pctmale)
+ncoef <- nrow(prim_lme.unadj.pctmale.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pctmale <- confint.lme(prim_lme.unadj.pctmale, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pctmale) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pctmale$variable <- c(rep("pct_male", 4))
+prim_ci.unadj.pctmale$bmore <- c(0,0,1,1)
+prim_ci.unadj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+# fit model
+prim_lme.unadj.pctunemp <- lmer(turnout ~ election*isBmore*(pct_unemployed) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pctunemp.summary <- summary(prim_lme.unadj.pctunemp)
+ncoef <- nrow(prim_lme.unadj.pctunemp.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pctunemp <- confint.lme(prim_lme.unadj.pctunemp, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pctunemp) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+prim_ci.unadj.pctunemp$bmore <- c(0,0,1,1)
+prim_ci.unadj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+# fit model
+prim_lme.unadj.pcths <- lmer(turnout ~ election*isBmore*(pct_hs) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pcths.summary <- summary(prim_lme.unadj.pcths)
+ncoef <- nrow(prim_lme.unadj.pcths.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pcths <- confint.lme(prim_lme.unadj.pcths, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pcths) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pcths$variable <- c(rep("pct_hs", 4))
+prim_ci.unadj.pcths$bmore <- c(0,0,1,1)
+prim_ci.unadj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+# fit model
+prim_lme.unadj.pcttransit <- lmer(turnout ~ election*isBmore*(pct_transit) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pcttransit.summary <- summary(prim_lme.unadj.pcttransit)
+ncoef <- nrow(prim_lme.unadj.pcttransit.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pcttransit <- confint.lme(prim_lme.unadj.pcttransit, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pcttransit) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pcttransit$variable <- c(rep("pct_transit", 4))
+prim_ci.unadj.pcttransit$bmore <- c(0,0,1,1)
+prim_ci.unadj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+# fit model
+prim_lme.unadj.pctaa <- lmer(turnout ~ election*isBmore*(pct_aa) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pctaa.summary <- summary(prim_lme.unadj.pctaa)
+ncoef <- nrow(prim_lme.unadj.pctaa.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pctaa<- confint.lme(prim_lme.unadj.pctaa, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pctaa) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pctaa$variable <- c(rep("pct_aa", 4))
+prim_ci.unadj.pctaa$bmore <- c(0,0,1,1)
+prim_ci.unadj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+# fit model
+prim_lme.unadj.pcthisp <- lmer(turnout ~ election*isBmore*(pct_hisp) + (1|county_name/tract_id), dat = dat.prim)
+
+# get model summary
+prim_lme.unadj.pcthisp.summary <- summary(prim_lme.unadj.pcthisp)
+ncoef <- nrow(prim_lme.unadj.pcthisp.summary$coefficients)
+
+# preallocate indicator matrix for adding estimates
+ind <- matrix(rep(0,ncoef*4), nrow = ncoef, ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,6),2] <- 1 # !bmore & 2022
+ind[c(4,7),3] <- 1 # bmore & 2020
+ind[c(4,6,7,8),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+prim_ci.unadj.pcthisp <- confint.lme(prim_lme.unadj.pcthisp, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(prim_ci.unadj.pcthisp) <- c("Est", "Lower", "Upper")
+prim_ci.unadj.pcthisp$variable <- c(rep("pct_hisp", 4))
+prim_ci.unadj.pcthisp$bmore <- c(0,0,1,1)
+prim_ci.unadj.pcthisp$year <- rep(c(2020,2022), 2)
+```
+
+I've created a table displaying the unadjusted parameter estimates below:
+
+```{r}
+prim_ci.unadj <- rbind(prim_ci.unadj.medinc, prim_ci.unadj.over65, prim_ci.unadj.pctaa, prim_ci.unadj.pcthisp,
+                  prim_ci.unadj.pcths, prim_ci.unadj.pctmale, prim_ci.unadj.pcttransit, prim_ci.unadj.pctunemp)
+
+prim_ci.unadj[,1:3] <- round(prim_ci.unadj[,1:3],3)
+prim_ci.unadj
+```
+
+### Adjusted Model (LME)
+
+```{r}
+# fit adjusted model for primary elections
+prim_lme.adj <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.prim)
+
+prim_lme.adj.summary <- summary(prim_lme.adj)
+prim_lme.adj.summary
+
+# fit standardized adjusted model for primary elections
+prim_lme.adj.st <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.prim.st)
+
+prim_lme.adj.st.summary <- summary(prim_lme.adj.st)
+prim_lme.adj.st.summary
+```
+
+#### Diagnostics
+
+I want to evaluate the fit of the (standardized) LME model and assess its sensitivity to outliers and influential points.
+
+Step 1) Plot residuals against fitted values from standardized adjusted model.
+```{r}
+plot(prim_lme.adj)
+qqnorm(resid(prim_lme.adj))
+qqline(resid(prim_lme.adj))
+```
+
+Step 2) Identify census tracts with the largest residuals
+
+```{r}
+dat.prim.st$res <- prim_lme.adj.st.summary$residuals
+dat.prim.st$fitted <- predict(prim_lme.adj.st, dat.prim.st, re.form = NULL)
+
+dat.prim.st %>%
+  select(tract_id, county_name, fitted, res) %>%
+  arrange(desc(abs(res))) %>%
+  head(15)
+```
+
+Step 2) Use Cook's distance to identify influential data points.
+
+```{r}
+dat.prim.st$cooks_distance <- cooks.distance(prim_lme.adj.st)
+
+# identify most influential points
+dat.prim.st %>%
+  arrange(desc(cooks_distance)) %>%
+  select(tract_id, county_name, election, cooks_distance, fitted, res) %>%
+  head()
+```
+
+Step 3) Compare model excluding the most influential census tracts to the original model
+
+I will now refit the standardized lme model excluding the 2 census tracts with cooks distance > 0.5, and compare it to the original model fit.
+
+```{r}
+tracts_to_exclude <- c(24510271503, 24033805601)
+dat.prim.st.ex <- dat.prim.st %>%
+  filter(!tract_id %in% tracts_to_exclude)
+
+# refit model
+prim_lme.adj.st.ex <- lmer(turnout ~ isBmore*election*(pct_aa + pct_hisp + pct_male + median_income + median_income_sp1 + pct_over_65 + pct_unemployed + pct_hs + pct_transit) + (1|county_name/tract_id), REML = F, data = dat.prim.st.ex)
+
+prim_lme.adj.st.ex.summary <- summary(prim_lme.adj.st.ex)
+
+# compare new coefficient estimates with original ones
+prim_lme.adj.st.t <- round(cbind(prim_lme.adj.st.summary$coefficients[,c(1,5)],
+                           prim_lme.adj.st.ex.summary$coefficients[,c(1,5)]),3)
+
+prim_lme.adj.st.t
+```
+
+We can see that the estimates and their significance changed very little after excluding these census tracts. This suggests model inferences are not overly sensitive to the presence of these outliers.
+
+### Model Summary
+
+To summarize the adjusted model, I will extract the coefficient estimates and their confidence intervals separately for election year and `isBmore` status.
+
+#### Unstandardized adjusted model
+
+```{r}
+prim_lme.adj.coefs <- summary(prim_lme.adj)$coefficients %>%
+  as.data.frame() %>%
+  select(Estimate)
+
+prim_lme.adj.coefs$idx <- 1:nrow(prim_lme.adj.coefs)
+prim_lme.adj.coefs
+
+################ median income ################
+
+# isbmore and gen_2020
+ind <- matrix(0,nrow=nrow(prim_lme.adj.coefs),ncol=8)
+ind[7,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(7,26),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(7,17),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(7,17,26,35),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(7,8),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(7,8,26,27),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(7,8,17,18),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(7,8,17,18,26,27,35,36),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.medinc <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.medinc) <- c("Est", "Lower", "Upper")
+ci.adj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+ci.adj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+ci.adj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[9,1] <- 1 # !bmore & 2020
+ind[c(9,28),2] <- 1 # !bmore & 2022
+ind[c(9,19),3] <- 1 # bmore & 2020
+ind[c(9,19,28,37),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.over65 <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.over65) <- c("Est", "Lower", "Upper")
+ci.adj.over65$variable <- c(rep("pct_over_65", 4))
+ci.adj.over65$bmore <- c(0,0,1,1)
+ci.adj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[6,1] <- 1 # !bmore & 2020
+ind[c(6,25),2] <- 1 # !bmore & 2022
+ind[c(6,16),3] <- 1 # bmore & 2020
+ind[c(6,16,25,34),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctmale <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctmale) <- c("Est", "Lower", "Upper")
+ci.adj.pctmale$variable <- c(rep("pct_male", 4))
+ci.adj.pctmale$bmore <- c(0,0,1,1)
+ci.adj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[10,1] <- 1 # !bmore & 2020
+ind[c(10,29),2] <- 1 # !bmore & 2022
+ind[c(10,20),3] <- 1 # bmore & 2020
+ind[c(10,20,29,38),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctunemp <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctunemp) <- c("Est", "Lower", "Upper")
+ci.adj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+ci.adj.pctunemp$bmore <- c(0,0,1,1)
+ci.adj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[11,1] <- 1 # !bmore & 2020
+ind[c(11,30),2] <- 1 # !bmore & 2022
+ind[c(11,21),3] <- 1 # bmore & 2020
+ind[c(11,21,30,39),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcths <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcths) <- c("Est", "Lower", "Upper")
+ci.adj.pcths$variable <- c(rep("pct_hs", 4))
+ci.adj.pcths$bmore <- c(0,0,1,1)
+ci.adj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[12,1] <- 1 # !bmore & 2020
+ind[c(12,31),2] <- 1 # !bmore & 2022
+ind[c(12,22),3] <- 1 # bmore & 2020
+ind[c(12,22,31,40),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcttransit <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcttransit) <- c("Est", "Lower", "Upper")
+ci.adj.pcttransit$variable <- c(rep("pct_transit", 4))
+ci.adj.pcttransit$bmore <- c(0,0,1,1)
+ci.adj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,23),2] <- 1 # !bmore & 2022
+ind[c(4,14),3] <- 1 # bmore & 2020
+ind[c(4,14,23,32),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctaa <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctaa) <- c("Est", "Lower", "Upper")
+ci.adj.pctaa$variable <- c(rep("pct_aa", 4))
+ci.adj.pctaa$bmore <- c(0,0,1,1)
+ci.adj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.coefs), ncol = 4)
+ind[5,1] <- 1 # !bmore & 2020
+ind[c(5,24),2] <- 1 # !bmore & 2022
+ind[c(5,15),3] <- 1 # bmore & 2020
+ind[c(5,15,24,33),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcthisp <- confint.lme(prim_lme.adj, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcthisp) <- c("Est", "Lower", "Upper")
+ci.adj.pcthisp$variable <- c(rep("pct_hisp", 4))
+ci.adj.pcthisp$bmore <- c(0,0,1,1)
+ci.adj.pcthisp$year <- rep(c(2020,2022), 2)
+
+################ combine tables ################
+prim_ci.adj <- rbind(ci.adj.medinc, ci.adj.over65, ci.adj.pctaa, ci.adj.pcthisp,
+                  ci.adj.pcths, ci.adj.pctmale, ci.adj.pcttransit, ci.adj.pctunemp)
+
+prim_ci.adj[,1:3] <- round(prim_ci.adj[,1:3],3)
+prim_ci.adj
+```
+
+```{r}
+# define controls for plotting model fits
+bmore_dat <- dat.prim %>%
+  filter(isBmore == 1, election == "prim_2020")
+
+controls <- bmore_dat %>%
+  summarize(med_median_income = median(median_income),
+            max_median_income = max(median_income),
+            min_median_income = min(median_income),
+            med_pct_aa = median(pct_aa),
+            max_pct_aa = max(pct_aa),
+            min_pct_aa = min(pct_aa),
+            med_pct_hisp = median(pct_hisp),
+            max_pct_hisp = max(pct_hisp),
+            min_pct_hisp = min(pct_hisp),
+            med_pct_over_65 = median(pct_over_65),
+            max_pct_over_65 = max(pct_over_65),
+            min_pct_over_65 = min(pct_over_65),
+            med_pct_male = median(pct_male),
+            max_pct_male = max(pct_male),
+            min_pct_male = min(pct_male),
+            med_pct_unemployed = median(pct_unemployed),
+            max_pct_unemployed = max(pct_unemployed),
+            min_pct_unemployed = min(pct_unemployed),
+            med_pct_hs = median(pct_hs),
+            max_pct_hs = max(pct_hs),
+            min_pct_hs = min(pct_hs),
+            med_pct_transit = median(pct_transit),
+            max_pct_transit = max(pct_transit),
+            min_pct_transit = min(pct_transit))
+
+controls
+```
+
+```{r}
+# primary elections
+
+################ median income ################
+new_data.medinc <- get_new_data(controls, "median_income", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.medinc, re.form = NA, se.fit=TRUE)
+
+new_data.medinc$fitted <- pred$fit
+new_data.medinc$se <- pred$se.fit
+new_data.medinc$variable <- "Median Income"
+new_data.medinc <- new_data.medinc %>%
+  mutate(value = median_income) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ over 65 ################
+new_data.over65 <- get_new_data(controls, "pct_over_65", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.over65, re.form = NA, se.fit=TRUE)
+
+new_data.over65$fitted <- pred$fit
+new_data.over65$se <- pred$se.fit
+new_data.over65$variable <- "% Over 65"
+new_data.over65 <- new_data.over65 %>%
+  mutate(value = pct_over_65) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent male ################
+new_data.pctmale <- get_new_data(controls, "pct_male", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pctmale, re.form = NA, se.fit=TRUE)
+
+new_data.pctmale$fitted <- pred$fit
+new_data.pctmale$se <- pred$se.fit
+new_data.pctmale$variable <- "% Male"
+new_data.pctmale <- new_data.pctmale %>%
+  mutate(value = pct_male) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent unemployed ################
+new_data.pctunemp <- get_new_data(controls, "pct_unemployed", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pctunemp, re.form = NA, se.fit=TRUE)
+
+new_data.pctunemp$fitted <- pred$fit
+new_data.pctunemp$se <- pred$se.fit
+new_data.pctunemp$variable <- "% Unemployed"
+new_data.pctunemp <- new_data.pctunemp%>%
+  mutate(value = pct_unemployed) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent high school attainment ################
+new_data.pcths <- get_new_data(controls, "pct_hs", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pcths, re.form = NA, se.fit=TRUE)
+
+new_data.pcths$fitted <- pred$fit
+new_data.pcths$se <- pred$se.fit
+new_data.pcths$variable <- "% High School"
+new_data.pcths <- new_data.pcths %>%
+  mutate(value = pct_hs) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent relying on public transit ################
+new_data.pcttransit <- get_new_data(controls, "pct_transit", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pcttransit, re.form = NA, se.fit=TRUE)
+
+new_data.pcttransit$fitted <- pred$fit
+new_data.pcttransit$se <- pred$se.fit
+new_data.pcttransit$variable <- "% Public Transit"
+new_data.pcttransit <- new_data.pcttransit %>%
+  mutate(value = pct_transit) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent African American ################
+new_data.pctaa <- get_new_data(controls, "pct_aa", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pctaa, re.form = NA, se.fit=TRUE)
+
+new_data.pctaa$fitted <- pred$fit
+new_data.pctaa$se <- pred$se.fit
+new_data.pctaa$variable <- "% African American"
+new_data.pctaa <- new_data.pctaa %>%
+  mutate(value = pct_aa) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ percent hispanic ################
+new_data.pcthisp <- get_new_data(controls, "pct_hisp", c("prim_2020", "prim_2022"))
+
+pred <- predict(prim_lme.adj, new_data.pcthisp, re.form = NA, se.fit=TRUE)
+
+new_data.pcthisp$fitted <- pred$fit
+new_data.pcthisp$se <- pred$se.fit
+new_data.pcthisp$variable <- "% Hispanic"
+new_data.pcthisp <- new_data.pcthisp %>%
+  mutate(value = pct_hisp) %>%
+  select(variable, isBmore, election, value, fitted, se)
+
+################ combine data frames ################
+new_data <- rbind(new_data.pctaa, new_data.pcthisp, new_data.pcths,
+                  new_data.pctmale, new_data.pcttransit, new_data.pctunemp,
+                  new_data.medinc, new_data.over65)
+
+# calculate confidence intervals
+new_data <- new_data %>%
+  mutate(lower = fitted - 1.96*se, upper = fitted + 1.96*se)
+```
+
+
+Plot model fits
+```{r}
+prim_lme.plot.2020 <- new_data %>%
+  filter(election == "prim_2020") %>%
+  ggplot(aes(x = value, y = fitted, color = isBmore)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = isBmore, color = NULL), alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 65)) +
+  facet_wrap(~variable, scale = "free_x") + 
+  labs(title = "Adjusted Model Fits for Primary 2020 Election") + 
+  theme_bw()
+
+prim_lme.plot.2022 <- new_data %>%
+  filter(election == "prim_2022") %>%
+  ggplot(aes(x = value, y = fitted, color = isBmore)) +
+  geom_hline(aes(yintercept = 0)) +
+  geom_hline(aes(yintercept = 50), linetype = "dashed") +
+  geom_line() +
+  geom_ribbon(aes(ymin = lower, ymax = upper, fill = isBmore, color = NULL), alpha = 0.2) +
+  coord_cartesian(ylim = c(0, 65)) +
+  facet_wrap(~variable, scale = "free_x") + 
+  labs(title = "Adjusted Model Fits for Primary 2022 Election") + 
+  theme_bw()
+
+prim_lme.plot.2020
+prim_lme.plot.2022
+```
+
+#### Standardized Adjusted Model
+
+```{r}
+prim_lme.adj.st.coefs <- summary(prim_lme.adj.st)$coefficients %>%
+  as.data.frame() %>%
+  select(Estimate)
+
+prim_lme.adj.st.coefs$idx <- 1:nrow(prim_lme.adj.st.coefs)
+prim_lme.adj.st.coefs
+
+################ median income ################
+
+# isbmore and gen_2020
+ind <- matrix(0,nrow=nrow(prim_lme.adj.st.coefs),ncol=8)
+ind[7,1] <- 1 # median_income < 75 & !bmore & 2020
+ind[c(7,26),2] <- 1 # median_income < 75 & !bmore & 2022
+ind[c(7,17),3] <- 1 # median_income < 75 & bmore & 2020
+ind[c(7,17,26,35),4] <- 1 # median_income < 75 & bmore & 2022
+ind[c(7,8),5] <- 1 # median_income >= 75 & !bmore & 2020
+ind[c(7,8,26,27),6] <- 1 # median_income >= 75 & !bmore & 2022
+ind[c(7,8,17,18),7] <- 1 # median_income >= 75 & bmore & 2020
+ind[c(7,8,17,18,26,27,35,36),8] <- 1 # median_income >= 75 & bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.medinc <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.medinc) <- c("Est", "Lower", "Upper")
+ci.adj.medinc$variable <- c(rep("median_income < 75", 4), rep("median_income >= 75", 4))
+ci.adj.medinc$bmore <- c(0,0,1,1,0,0,1,1)
+ci.adj.medinc$year <- rep(c(2020,2022), 4)
+
+################ percent over 65 ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[9,1] <- 1 # !bmore & 2020
+ind[c(9,28),2] <- 1 # !bmore & 2022
+ind[c(9,19),3] <- 1 # bmore & 2020
+ind[c(9,19,28,37),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.over65 <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.over65) <- c("Est", "Lower", "Upper")
+ci.adj.over65$variable <- c(rep("pct_over_65", 4))
+ci.adj.over65$bmore <- c(0,0,1,1)
+ci.adj.over65$year <- rep(c(2020,2022), 2)
+
+################ percent male ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[6,1] <- 1 # !bmore & 2020
+ind[c(6,25),2] <- 1 # !bmore & 2022
+ind[c(6,16),3] <- 1 # bmore & 2020
+ind[c(6,16,25,34),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctmale <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctmale) <- c("Est", "Lower", "Upper")
+ci.adj.pctmale$variable <- c(rep("pct_male", 4))
+ci.adj.pctmale$bmore <- c(0,0,1,1)
+ci.adj.pctmale$year <- rep(c(2020,2022), 2)
+
+################ percent unemployed ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[10,1] <- 1 # !bmore & 2020
+ind[c(10,29),2] <- 1 # !bmore & 2022
+ind[c(10,20),3] <- 1 # bmore & 2020
+ind[c(10,20,29,38),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctunemp <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctunemp) <- c("Est", "Lower", "Upper")
+ci.adj.pctunemp$variable <- c(rep("pct_unemployed", 4))
+ci.adj.pctunemp$bmore <- c(0,0,1,1)
+ci.adj.pctunemp$year <- rep(c(2020,2022), 2)
+
+################ percent high school attainment ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[11,1] <- 1 # !bmore & 2020
+ind[c(11,30),2] <- 1 # !bmore & 2022
+ind[c(11,21),3] <- 1 # bmore & 2020
+ind[c(11,21,30,39),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcths <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcths) <- c("Est", "Lower", "Upper")
+ci.adj.pcths$variable <- c(rep("pct_hs", 4))
+ci.adj.pcths$bmore <- c(0,0,1,1)
+ci.adj.pcths$year <- rep(c(2020,2022), 2)
+
+################ percent reliance on public transit ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[12,1] <- 1 # !bmore & 2020
+ind[c(12,31),2] <- 1 # !bmore & 2022
+ind[c(12,22),3] <- 1 # bmore & 2020
+ind[c(12,22,31,40),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcttransit <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcttransit) <- c("Est", "Lower", "Upper")
+ci.adj.pcttransit$variable <- c(rep("pct_transit", 4))
+ci.adj.pcttransit$bmore <- c(0,0,1,1)
+ci.adj.pcttransit$year <- rep(c(2020,2022), 2)
+
+################ percent African American ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[4,1] <- 1 # !bmore & 2020
+ind[c(4,23),2] <- 1 # !bmore & 2022
+ind[c(4,14),3] <- 1 # bmore & 2020
+ind[c(4,14,23,32),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pctaa <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pctaa) <- c("Est", "Lower", "Upper")
+ci.adj.pctaa$variable <- c(rep("pct_aa", 4))
+ci.adj.pctaa$bmore <- c(0,0,1,1)
+ci.adj.pctaa$year <- rep(c(2020,2022), 2)
+
+################ percent hispanic ################
+# preallocate indicator matrix for adding estimates
+ind <- matrix(0, nrow = nrow(prim_lme.adj.st.coefs), ncol = 4)
+ind[5,1] <- 1 # !bmore & 2020
+ind[c(5,24),2] <- 1 # !bmore & 2022
+ind[c(5,15),3] <- 1 # bmore & 2020
+ind[c(5,15,24,33),4] <- 1 # bmore & 2022
+
+# get confidence intervals for desired linear combination of estimates
+ci.adj.pcthisp <- confint.lme(prim_lme.adj.st, ind, 0.05) %>%
+  as.data.frame()
+
+colnames(ci.adj.pcthisp) <- c("Est", "Lower", "Upper")
+ci.adj.pcthisp$variable <- c(rep("pct_hisp", 4))
+ci.adj.pcthisp$bmore <- c(0,0,1,1)
+ci.adj.pcthisp$year <- rep(c(2020,2022), 2)
+
+################ combine tables ################
+prim_ci.adj.st <- rbind(ci.adj.medinc, ci.adj.over65, ci.adj.pctaa, ci.adj.pcthisp,
+                  ci.adj.pcths, ci.adj.pctmale, ci.adj.pcttransit, ci.adj.pctunemp)
+
+prim_ci.adj.st[,1:3] <- round(prim_ci.adj.st[,1:3],3)
+prim_ci.adj.st
+```
+
+Plot standardized estimates
+```{r}
+prim_ci.adj.st %>%
+  ggplot(aes(x = Est, y = variable)) +
+  geom_vline(aes(xintercept = 0), linetype = "dashed") +
+  geom_point(aes(shape = factor(bmore), color = factor(bmore)),position = position_dodge(width = 0.5)) +
+  geom_errorbarh(aes(xmin = Lower, xmax = Upper, color = factor(bmore)), height = 0.3, position = position_dodge(width = 0.5)) +
+  labs(title = "Adjusted Standardized Estimates\nfor 2020/2022 Primary Elections", color = "Is in Baltimore City") +
+  guides(shape = "none") +
+  facet_wrap(~year) +
+  theme_bw()
+```
+
+
+
+
