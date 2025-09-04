@@ -1,0 +1,128 @@
+---
+title: "Data Cleaning"
+author: "Josh Stim"
+date: "2025-02-15"
+output: pdf_document
+---
+
+# Step 0: Load required R packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+library(readr)
+library(dplyr)
+```
+
+# Step 1: Load data from 01-compile-data
+```{r}
+load(here('data', 'compiled_tract_data.RData'))
+```
+
+# Step 2: Identify missingness profiles in compiled dataset
+```{r}
+compiled_tract_data$nmissing <- apply(compiled_tract_data, 1, function(x) sum(is.na(x)))
+
+compiled_tract_data.missing <- compiled_tract_data %>%
+  filter(nmissing > 0)
+
+compiled_tract_data.missing.bin <- as.data.frame(sapply(compiled_tract_data.missing, function(x) is.na(x))) 
+
+group_num <- 0
+missingness_group <- rep(0,nrow(compiled_tract_data.missing.bin))
+for (j in 1:nrow(compiled_tract_data.missing.bin)) {
+
+    if (missingness_group[j] == 0) {
+      group_num <- group_num + 1
+      idx <- apply(compiled_tract_data.missing.bin, 1, function(x) sum(x != compiled_tract_data.missing.bin[j,]))
+      missingness_group[which(idx == 0)] <- group_num
+    }
+}
+
+summary(factor(missingness_group)) 
+```
+
+Based on our missingness groupings, we see the following distribution of missingness profiles in our data:
+
+**missingness group 1:** 24
+
+**missingness group 2:** 4
+
+**missingness group 3:** 14
+
+**missingness group 4:** 1
+
+**missingness group 5:** 2
+
+**total:** 45
+
+Now, I will investigate each missingness group, individually, to determine potential causes for the missingness.
+
+## a. Missingness group 1
+
+Missingness in group 1 seems to stem from the fact that these observations come from "unassigned" city blocks. To my understanding, the L2 database provides demographic and voter data for all identifiable city blocks. Data from "unassigned" blocks (i.e., blocks without a valid GEOID) are simply lumped together with all other "unassigned" blocks for a given county. Because these blocks do not have a valid GEOID, we were unable to pull census data from these blocks, which explains why there are so many missing values.
+```{r}
+compiled_tract_data.missing %>%
+  filter(missingness_group == 1)
+```
+
+## b. Missingness group 2
+
+Missingness in this group can be largely explained by the presence of correctional facilities within GEOIDs 24003740400, 24043011000, 24510100300. Many people within these census tracts are likely incarcerated and may be unable to vote or contribute to the census.
+
+Missingness in GEOID 24003980000 may be explained by its extremely low population. This tract is largely covered by the BWI airport. 
+```{r}
+compiled_tract_data.missing %>%
+  filter(missingness_group == 2)
+```
+
+## c. Missingness group 3
+
+These tracts are missing data for virtually all demographic measures (from L2 and census). Many of these tracts are covered by industrial zones, and are likely to have very few permanent residents.
+```{r}
+compiled_tract_data.missing %>%
+  filter(missingness_group == 3)
+```
+
+## d. Missingness group 4
+
+This census tract is primarily commercial, and has very few permanent residents. As such, many of the census counts are missing.
+```{r}
+compiled_tract_data.missing %>%
+  filter(missingness_group == 4)
+```
+
+## e. Missingness group 5
+
+GEOID 24510190300 is missing census data on median household income. This tract has around 1000 residents, so I am not sure why we are missing this data point.
+
+GEOID 24510250600 is mostly industrial and likely has very few residents. This may explain why we are missing median household income for this census tract.
+```{r}
+compiled_tract_data.missing %>%
+  filter(missingness_group == 5)
+```
+
+# Step 3: Remove observations (n = 45) that have missing values for one or more variables
+
+Based on my assessment, a total of 45 observations have missing values for one or more variables. 
+
+```{r}
+compiled_tract_data.cleaned <- compiled_tract_data %>%
+  filter(nmissing == 0)
+
+compiled_tract_data.cleaned
+```
+
+# Step 4: Check that variable ranges make sense
+
+Based on the data summary, we can see that all count variables have a minimum bound of 0. All percentage variables are bounded by 0 and 100 (i.e., no percentages exceed 100). Median household income is bounded by 10000 and 250000, which seems like a reasonable range.
+
+```{r}
+summary(compiled_tract_data.cleaned)
+```
+ 
+# Step 5: Save cleaned data frame
+```{r}
+save(compiled_tract_data.cleaned, file = here('data', 'compiled_tract_data_cleaned.RData'))
+```
+

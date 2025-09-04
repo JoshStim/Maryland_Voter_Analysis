@@ -1,0 +1,173 @@
+---
+title: "Compiling Voter Data from Maryland Census Tracts"
+output: html_document
+date: "2025-02-16"
+---
+
+# Step 0: Load required R packages
+```{r setup}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidycensus)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(here)
+```
+
+# Step 1: Extract 2022 voter turnout percentages and census tract demographics from L2 Maryland voter files 
+
+## a. Load block-level L2 voter data
+```{r}
+turnout_block <- read.csv(here('data', 'MD_l2_2022stats_2020block.csv'), header = TRUE)
+```
+
+## b. Aggregate block-level data to census tracts
+```{r}
+# Aggregate data at the census-tract level
+turnout_tract <- turnout_block %>%
+  mutate(GEOID = substr(geoid20, 1, 11)) %>%
+  select(GEOID, ends_with("reg_all"), ends_with("voted_all"),
+         total_reg, age_18_19, age_20_24, age_25_29, age_30_34, age_35_44, 
+         age_45_54, age_55_64, age_65_74, age_75_84, age_85over, 
+         voters_gender_m, voters_gender_f, voters_gender_unknown, 
+         eth1_eur, eth1_hisp, eth1_aa, eth1_esa, eth1_oth, eth1_unk) %>% 
+  group_by(GEOID) %>%  # Group by Census Tract (GEOID)
+  summarise(
+    # Record number of blocks within census tract
+    nblocks = n(),
+    
+    # Summarize total registered and voted
+    gen2022_voted = sum(g20221108_voted_all),  # Total votes cast in general 2022 election
+    gen2022_reg = sum(g20221108_reg_all),      # Total registered voters in general 2022 election
+    gen2020_voted = sum(g20201103_voted_all),
+    gen2020_reg = sum(g20201103_reg_all),
+    prim2022_voted = sum(p20220719_voted_all),
+    prim2022_reg = sum(p20220719_reg_all),
+    prim2020_voted = sum(p20200602_voted_all),
+    prim2020_reg = sum(p20200602_reg_all),
+    total_reg = sum(total_reg),
+    
+    # Gender counts
+    male_count = sum(voters_gender_m),
+    female_count = sum(voters_gender_f),
+    unknown_gender_count = sum(voters_gender_unknown),
+    
+    # Age group counts
+    age_18_19_count = sum(age_18_19),
+    age_20_24_count = sum(age_20_24),
+    age_25_29_count = sum(age_25_29),
+    age_30_34_count = sum(age_30_34),
+    age_35_44_count = sum(age_35_44),
+    age_45_54_count = sum(age_45_54),
+    age_55_64_count = sum(age_55_64),
+    age_65_74_count = sum(age_65_74),
+    age_75_84_count = sum(age_75_84),
+    age_85over_count = sum(age_85over),
+    
+    # Race/ethnicity counts
+    white_count = sum(eth1_eur),
+    hispanic_count = sum(eth1_hisp),
+    black_count = sum(eth1_aa),
+    asian_count = sum(eth1_esa),
+    other_race_count = sum(eth1_oth),
+    unknown_race_count = sum(eth1_unk)
+  ) 
+```
+
+# STEP 2: Get additional 2022 demographic data for all Maryland census tracts using R::tidycensus
+
+## a. Install CENSUS API key if you don't already have one
+```{r}
+#census_api_key("YOUR_CENSUS_API_KEY", install = TRUE)
+#Sys.getenv("CENSUS_API_KEY")
+```
+
+## b. Extract demographic variables using tidycensus
+```{r}
+# Define variables we want to pull from census database
+vars.lookup <- c(
+  total_commuters = "B08006_001", 
+  drove_alone_to_work = "B08006_002", 
+  public_transit_users = "B08006_008", 
+  worked_from_home = "B08006_014",
+  total_education_population = "B15003_001",
+  high_school_graduate = "B15003_017", 
+  bachelors_degree = "B15003_023", 
+  graduate_professional_degree = "B15003_025",
+  median_household_income = "B19013_001",
+  total_employed = "B23025_004", 
+  total_unemployed = "B23025_005"
+)
+
+# Pull from census database
+md_tract_data <- get_acs(
+  geography = "tract", # Pulls data at the census-tract level
+  state = "MD",
+  variables = vars.lookup,
+  year = 2022,
+  survey = "acs5", # latest 5-year average
+  geometry = TRUE
+)
+
+# Rename variables and display data in a user-friendly format
+md_tract_data_wide <- md_tract_data %>%
+  select(GEOID, NAME, variable, estimate, geometry) %>%
+  pivot_wider(id_cols = c(GEOID, NAME, geometry), names_from = variable, values_from = estimate)
+
+colnames(md_tract_data_wide)[4:ncol(md_tract_data_wide)] <- names(vars.lookup)
+```
+
+# Step 3: Join tract-level L2 voter data with census data
+
+## a. Combine using dplyr::full_join
+```{r}
+# Combine using dplyr::left_join
+compiled_tract_data <- turnout_tract %>%
+  full_join(md_tract_data_wide, by = "GEOID")
+```
+
+## b. Create geographic variables and transform count variables to percentages
+```{r}
+compiled_tract_data <- compiled_tract_data %>%
+  mutate(
+  # Geographic identifiers
+  fip = substr(GEOID, 1, 5),
+  is_baltimore = grepl("Baltimore city", NAME),
+  county = ifelse(is_baltimore, "Baltimore City", sub("Census Tract .*?; (.*?);.*", "\\1", NAME)),
+  
+  # Education percentages
+  high_school_pct = high_school_graduate / total_education_population * 100,
+  bachelors_pct = bachelors_degree / total_education_population * 100,
+  graduate_pct = graduate_professional_degree / total_education_population * 100,
+  
+  # Percent over 65
+  pct_over_65 = 100 * (age_65_74_count + age_75_84_count + age_85over_count) / total_reg,
+  
+  # Employment percentages
+  unemployment_pct = total_unemployed / (total_employed + total_unemployed) * 100,
+  
+  # Transportation percentages
+  drove_alone_pct = drove_alone_to_work / total_commuters * 100,
+  public_transit_pct = public_transit_users / total_commuters * 100,
+  worked_from_home_pct = worked_from_home / total_commuters * 100,
+  
+  # Gender percentages
+  male_pct = male_count / total_reg * 100,
+  female_pct = female_count / total_reg * 100,
+  unknown_gender_pct = unknown_gender_count / total_reg * 100,
+  
+  # Race percentages
+  white_pct = white_count / total_reg * 100,
+  hispanic_pct = hispanic_count / total_reg * 100,
+  black_pct = black_count / total_reg * 100,
+  asian_pct = asian_count / total_reg * 100,
+  other_race_pct = other_race_count / total_reg * 100,
+  unknown_race_pct = unknown_race_count / total_reg * 100
+  ) %>%
+  relocate(GEOID, fip, NAME, county, is_baltimore, nblocks, geometry)
+```
+
+## c. Save compiled data to ./data/combined_tract_data.RData
+```{r}
+save(compiled_tract_data, file = here('data', 'compiled_tract_data.RData'))
+```
