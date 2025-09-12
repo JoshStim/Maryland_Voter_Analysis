@@ -18,6 +18,4 @@ L2 is a trusted source of up-to-date voter data for all 50 states in the US. For
 
   - **Age bins among registered voters**: The number of registered voters in 2022 in each of the following age bins: 18-19, 20-24, 25-29, 30-34, 35-44, 45-54, 55-64, 65-74, 75-84, 85-older
 
-  - **Ethnicity counts among registered voters**: The number of registered voters in 2022 in each of the following ethnicity bins: European, Hispanic, African American, Eastern Asian, Other, and Unknown
-
-
+  - **Ethnicity counts among registered voters**: The number of registered voters in 2022 whose primary ethnicity was one of the following: European, Hispanic, African American, Eastern Asian, Other, and Unknown
