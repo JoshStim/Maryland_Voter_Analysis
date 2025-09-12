@@ -12,8 +12,12 @@ L2 is a trusted source of up-to-date voter data for all 50 states in the US. For
 
   - **Registered voter counts by election**: The number of registered voters for the 2020 and 2022 general and primary elections
 
-  - **Vote counts by election**: The number of votes cast for the 2020 and 2022 general and primary elections
+  - **Votes cast by election**: The number of votes cast for the 2020 and 2022 general and primary elections
 
-  - **Gender counts among registered voters (2022)**: The number of registered voters (2022) who identified as Male, Female, or "Unknown".
+  - **Gender counts among registered voters**: The number of registered voters in 2022 in each of the following gender bins: Male, Female, or "Unknown"
 
-  - **Age bins among registered voters (2022)**: Registered voters counts (2022) were obtained for each of the following age bins: 18-19, 20-24, 25-29, 30-34, 35-44, 45-54, 55-64, 65-74, 75-84, 85-.
+  - **Age bins among registered voters**: The number of registered voters in 2022 in each of the following age bins: 18-19, 20-24, 25-29, 30-34, 35-44, 45-54, 55-64, 65-74, 75-84, 85-older
+
+  - **Ethnicity counts among registered voters**: The number of registered voters in 2022 in each of the following ethnicity bins: European, Hispanic, African American, Eastern Asian, Other, and Unknown
+
+
