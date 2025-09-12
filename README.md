@@ -10,9 +10,9 @@ Data for this study were obtained from two sources: the L2 Voter Database and th
 
 L2 is a trusted source of up-to-date voter data for all 50 states in the US. For the current analysis, we obtained 2022 registered voter data for Maryland at the census-block level. For each of the 83,827 unique census blocks provided, we obtained the following metrics on registered voters:
 
-  - **Registered voter counts by election**: The number of registered voters for the 2020 and 2022 general and primary elections
+  - **Registered voter counts x election**: The number of registered voters for the 2020 and 2022 general and primary elections
 
-  - **Votes cast by election**: The number of votes cast for the 2020 and 2022 general and primary elections
+  - **Votes cast x election**: The number of votes cast for the 2020 and 2022 general and primary elections
 
   - **Gender counts among registered voters**: The number of registered voters in 2022 in each of the following gender bins: Male, Female, or "Unknown"
 
