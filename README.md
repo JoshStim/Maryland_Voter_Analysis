@@ -4,9 +4,9 @@ Baltimore City’s voter turnout is approximately 10% lower than the Maryland st
 
 ## Data
 
-Data for this study were obtained from two sources: 2022 L2 voter files and the American Community Survey (ACS).
+Data for this study were obtained from two sources: the L2 Voter Database and the American Community Survey (ACS).
 
-### L2 Voter Files
+### L2 Voter Database
 
 L2 is a trusted source of up-to-date voter data for all 50 states in the US. For the current analysis, we obtained 2022 registered voter data for Maryland at the census-block level. For each of the 83,827 unique census blocks provided, we obtained the following metrics on registered voters:
 
