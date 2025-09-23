@@ -26,8 +26,8 @@ ACS is a survey conducted by the US Census that provides detailed social, econom
 
   - **Means of transportation to work (`B08006`)**: This data table contains information on peoples' primary method of transportation to work. The universe is people who are 16 years or older. For each Maryland census tract, we extracted count estimates for the number of people who drive to work alone (`B08006_002`), use public transportion (`B08006_008`), bicycle to work (`B08006_014`), walk to work (`B08006_015`), taxi to work (`B08006_016`), and work from home (`B08006_017`).
 
-  - **Educational attainment**:
+  - **Educational attainment (`B15003`)**: 
 
-  - **Median household income**:
+  - **Median household income (`B19013`)**:
 
-  - **Employment status**:
+  - **Employment status (`B23025`)**:
