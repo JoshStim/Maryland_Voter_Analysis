@@ -24,9 +24,9 @@ L2 is a trusted source of up-to-date voter data for all 50 states in the US. For
 
 ACS is a survey conducted by the US Census that provides detailed social, economic, housing, and demographic information from a sample of households in all 50 US states, the District of Columbia, and Puerto Rico. Using `tidycensus` in R, we extracted the 5-year average, ending in 2022, for a subset of ACS variables for each census tract in Maryland. These variables are described below:
 
-  - **Means of transportation to work (`B08006`)**: This data table contains information on peoples' primary method of transportation to work. The universe is people who are 16 years or older. For each Maryland census tract, we extracted count estimates for the number of people who drive to work alone (`B08006_002`), use public transportion (`B08006_008`), bicycle to work (`B08006_014`), walk to work (`B08006_015`), taxi to work (`B08006_016`), and work from home (`B08006_017`).
+  - **Means of transportation to work (`B08006`)**: This data table contains information on peoples' primary method of transportation to work. The universe is people who are 16 years or older. For each Maryland census tract, we extracted count estimates for people who drive to work alone (`B08006_002`), use public transportion (`B08006_008`), bicycle to work (`B08006_014`), walk to work (`B08006_015`), taxi to work (`B08006_016`), and work from home (`B08006_017`).
 
-  - **Educational attainment (`B15003`)**: 
+  - **Educational attainment (`B15003`)**: This data table contains information on educational attainment (i.e., highest level of education attained). The universe is people who are 25 years or older. For each Maryland census tract, we extracted count estimates for people whose maximum eduational attainment was a high school diploma (`B15003_017`), a GED or alternative credential (`B15003_018`), less than 1 year of college (`B15003_019`), one or more years of college but not degree (`B15003_020`), an associate's degree (`B15003_021`), a bachelor's degree (`B15003_022`), a master's degree (`B15003_023`), a graduate professional degree (`B15003_024`), or a doctorate degree (`B15003_025`).
 
   - **Median household income (`B19013`)**:
 
