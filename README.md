@@ -20,6 +20,8 @@ L2 is a trusted source of up-to-date voter data for all 50 states in the US. For
 
   - **Ethnicity counts among registered voters**: The number of registered voters in 2022 in each of the following primary ethnicity bins: European, Hispanic, African American, Eastern Asian, Other, and Unknown
 
+These data were aggregated up to the census tract level by summing the count estimates across blocks within a census tract.
+
 ### American Community Survey (ACS)
 
 ACS is a survey conducted by the US Census that provides detailed social, economic, housing, and demographic information from a sample of households in all 50 US states, the District of Columbia, and Puerto Rico. Using `tidycensus` in R, we extracted the 5-year average, ending in 2022, for a subset of ACS variables for each census tract in Maryland. These variables are described below:
